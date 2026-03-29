@@ -5,7 +5,7 @@
 
 # COMMAND ----------
 
-from pyspark.sql import functions as f, DataFrame
+from pyspark.sql import functions as F, DataFrame
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 from datetime import datetime
@@ -165,4 +165,162 @@ def _save_dq_report(spark,dq_rows:list):
     )
 
 # COMMAND ----------
+
+# %md
+# ### SCD Type 1 Overwrite latest value (no history)
+# Mimics: dlt.apply_changes(...,stored_as_scd_type=1)
+
+# COMMAND
+
+def apply_scd1(
+    spark,
+    source_df: DataFrame,
+    target_table: str, # e.g. "circuitbox.silver.dim_customers"
+    key_cols: list,
+    logger: PipelineLogger = None
+):
+    """ 
+    Upsert source into target on key_cols.
+    Matching row -> update all columns (overwrite)
+    New row  -> insert
+    """
+
+    count = source_df.count()
+
+    if not spark.catalog.tableExists(target_table):
+        # First run - just create it
+        (
+        source_df.write
+        .format("delta")
+        .mode("overwrite")
+        .option("mergeSchema","true")
+        .saveAsTable(target_table)
+        )
+        if logger:
+            logger.log("dim_customers","PASS",count,
+            f"SCD1 initial load: {count} rows -> {target_table}")
+        return
+  
+    dt = DeltaTable.forName(spark,target_table)
+
+    merge_cond = " AND ".join(
+        [f"target.{k} = source.{k}" for k in key_cols]
+    )
+
+    (dt.alias("target")
+    .merge(source_df.alias("source"),merge_cond)
+    .whenMatchedUpdateAll()  # type 1: overwrite all columns
+    .whenNotMatchedInsertAll() # new customer : insert
+    .execute()
+    )
+  
+    if logger:
+        logger.log("dim_customers","PASS",count,
+        f"SCD1 upsert: {count} source rows merged into {target_table}"
+        )
+
+# COMMAND
+
+# %md
+# ### SCD Type 2 - keep full history with date ranges
+# Mimics: dlt.apply_changes(...,stored_as_scd_type=2)
+
+# COMMAND
+
+def apply_scd2(
+    spark,
+    source_df: DataFrame,
+    target_table: str, # e.g. "circuitbox.silver.dim_addresses"
+    key_cols: list, # e.g. ["customer_id"]
+    track_cols: list, #columns to detect changes on
+    logger: PipelineLogger=None
+):
+    """
+    For each key:
+        - If key is new   -> insert as current row
+        - If tracked cols changed -> expire old row , insert new current row
+        - If nothing changed -> do nothing
+    Adds columns: effective_start, effective_end (NULL = current), is_current
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    
+    # Add SCD2 metadata columns to incoming data
+    source_df = (
+        source_df
+        .withColumn("effective_start",F.lit(today))
+        .withColumn("effective_end",F.lit(None).cast("string"))
+        .withColumn("is_current", F.lit(True))
+    )
+
+    if not spark.catalog.tableExists(target_table):
+        (
+            source_df.write
+            .format("delta")
+            .mode("overwrite")
+            .option("mergeSchema","true")
+            .saveAsTable(target_table)
+        )
+        count = source_df.count()
+        if logger:
+            logger.log("dim_addresses","PASS",count,
+                       f"SCD2 initial load: {count} rows -> {target_table}")
+        return
+    
+    dt = DeltaTable.forName(spark,target_table)
+    target = dt.toDF()
+
+    # Detect which keys actually changed on tracked columns
+    key_cond = " AND ".join([f"s.{k} = t.{k}" for k in key_cols])
+    change_cond = " OR ".join([f"s.{c} != t.{c}" for c in track_cols])
+
+    changed_keys = (
+        source_df.alias("s")
+        .join(
+            target.filter(F.col("is_current") == True).alias("t"),
+            key_cols, "inner"
+        )
+        .filter(change_cond)
+        .select(*[F.col(f"s.{k}") for k in key_cols])
+    )
+
+    # step 1: Expire current rows for chamged keys
+    expire_cond = " AND ".join(
+    [f"target.{k} = updates.{k}" for k in key_cols]
+    )
+    (
+        dt.alias("target")
+        .merge(
+            changed_keys_alias("updates"),
+            f"{expire_cond} AND target.is_current = true"
+        )
+        .whenMatchedUpdate(set = {
+            "effective_end": F.lit(today),
+            "is_current": F.lit(False)
+        })
+        .execute()
+    )
+    # Step 2: Insert new rows for changed + new keys
+    new_keys = (
+        source_df.alias("s")
+        .join(
+            target.filter(F.col("is_current") == True).alias("t"),
+            key_cols,"left_anti" # keys not in target at all
+        )
+    )
+    rows_to_insert = source_df.join(
+        changed_keys.union(new_keys.select(*key_cols)),
+        key_cols,"inner"
+    )
+    (rows_to_insert.write
+     .format("delta")
+     .mode("append")
+     .option("mergeSchema","true")
+     .saveAsTable(target_table)
+     )
+    
+    count = rows_to_insert.count()
+    if logger:
+        logger.log("dim_addresses","PASS",count,
+                   f"SCD2: {count} new/changed rows inserted into {target_table}")
+                
 
