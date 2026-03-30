@@ -80,3 +80,28 @@ write_delta(
     mode="overwrite",
     logger = logger
 )
+
+# COMMAND ------
+
+# %md
+# ### Order Status funnel
+
+# COMMAND ------
+
+window_all = Window.rowsBetween(
+    Window.unboundedPreceding, Window.unboundedFollowing
+)
+
+status_funnel = (
+    orders
+    .groupBy("order_status")
+    .agg(
+        F.countDistinct("order_id").alias("order_count")
+    )
+    .withColumn("total",F.sum("order_count").over(window_all))
+    .withColumn("pct_of_total",F.round(F.col("order_count")/F.col("total")*100,1))
+    .drop("total")
+)
+
+write_delta(status_funnel,
+            "circuitbox.gold.order_status_funnel",mode ="overwrite",logger = logger)
