@@ -105,3 +105,24 @@ status_funnel = (
 
 write_delta(status_funnel,
             "circuitbox.gold.order_status_funnel",mode ="overwrite",logger = logger)
+
+# COMMAND -------
+
+# %md
+# ### Payment mix
+
+# COMMAND -------
+
+payment_mix = (
+    orders
+    .groupBy("payment_method")
+    .agg(
+        F.countDistinct("order_id").alias("order_count"),
+        F.round(F.sum("item_total"),2).alias("total_revenue")
+    )
+)
+
+write_delta(payment_mix,
+            "circuitbox.gold.payment_mix",
+            mode="overwrite",
+            logger=logger)
