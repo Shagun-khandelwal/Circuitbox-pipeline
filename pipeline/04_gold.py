@@ -126,3 +126,43 @@ write_delta(payment_mix,
             "circuitbox.gold.payment_mix",
             mode="overwrite",
             logger=logger)
+
+# COMMAND ---------------
+
+# %md
+# ### Materialized view Equivalent
+# - customer_order_summary - pre_joined, recomputed every run
+# - Power BI reads directly - no joins needed
+
+# COMMAND ----------------
+
+w = Window.rowsBetween(
+    Window.unboundedPreceding, Window.unboundedFollowing
+)
+
+customer_summary = (
+    orders
+    .groupBy("customer_id")
+    .agg(
+        F.countDistinct("order_id").alias("total_orders"),
+        F.round(F.sum("item_total"),2).alias("lifetime_value"),
+        F.round(F.avg("item_total"),2).alias("avg_order_value"),
+        F.max("order_date").alias("last_order_date"),
+        F.min("order_date").alias("first_order_date"),
+        F.datediff(F.current_date(),F.col("last_order_date")).alias("days_since_last_order")
+    )
+    .withColumn("customer_segment",
+                F.when(F.col("lifetime_value")>=1000,"VIP")
+                .when(F.col("lifetime_value") >= 500, "Regular")
+                .otherwise("New")
+                )
+    .join(customers.select("customer_id","customer_name","age","age_group","email_domain","contact_completeness"),"customer_id","left")
+    .join(addresses,"customer_id","left")
+)
+write_delta(customer_summary,
+            "circuitbox.gold.customer_order_summary",
+            mode="overwrite",
+            logger=logger)
+
+
+logger.summary()
