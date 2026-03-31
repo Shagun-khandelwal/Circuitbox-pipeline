@@ -267,60 +267,85 @@ def apply_scd2(
         return
     
     dt = DeltaTable.forName(spark,target_table)
-    target = dt.toDF()
+    target_df = dt.toDF()
+    current_df = target_df.filter(F.col("is_current") == True)
 
-    # Detect which keys actually changed on tracked columns
-    key_cond = " AND ".join([f"s.{k} = t.{k}" for k in key_cols])
-    change_cond = " OR ".join([f"s.{c} != t.{c}" for c in track_cols])
+    # Build join condition on key columns
+    key_join_cond = [source_df[k] == current_df[k] for k in key_cols]
 
-    changed_keys = (
-        source_df.alias("s")
-        .join(
-            target.filter(F.col("is_current") == True).alias("t"),
-            key_cols, "inner"
-        )
-        .filter(change_cond)
-        .select(*[F.col(f"s.{k}") for k in key_cols])
+    # Step 1: Find changed keys
+    # A key is "changed" when it exists in a target and at least one tracked column has a different value
+
+    change_filter = None
+
+    for col in track_cols:
+        cond = source_df[col] != current_df[col]
+        change_filter = cond if change_filter is None else (change_filter | cond)
+    
+    changed_keys_df = (
+        source_df
+        .join(current_df,key_join_cond,"inner")
+        .filter(change_filter)
+        .select([source_df[k] for k in key_cols])
+        .distinct()
     )
 
-    # step 1: Expire current rows for chamged keys
-    expire_cond = " AND ".join(
-    [f"target.{k} = updates.{k}" for k in key_cols]
+    # step 2: Find brand new keys
+    # keys in source that don't exist at all in target
+    new_keys_df = (
+        source_df
+        .join(current_df,key_join_cond,
+              "left_anti")
+        .select([source_df[k] for k in key_cols])
+        .distinct()
     )
+
+    # Step 3: Combine changed + new keys
+
+    keys_to_insert = changed_keys_df.union(new_keys_df)
+
+    # Step 4: Expire current rows for changed keys
+    # Build merge condition: target key = changed key and is_current
+    expire_merge_cond = " AND ".join(
+        [f"target.{k} = updates.{k}" for k in key_cols]
+    )
+
     (
         dt.alias("target")
         .merge(
-            changed_keys_alias("updates"),
-            f"{expire_cond} AND target.is_current = true"
+            changed_keys_df.alias("updates"),f"{expire_merge_cond} AND target.is_current = true"
         )
-        .whenMatchedUpdate(set = {
+        .whenMatchedUpdate(set={
             "effective_end": F.lit(today),
-            "is_current": F.lit(False)
+            "is_current":F.lit(False)
         })
         .execute()
     )
-    # Step 2: Insert new rows for changed + new keys
-    new_keys = (
-        source_df.alias("s")
-        .join(
-            target.filter(F.col("is_current") == True).alias("t"),
-            key_cols,"left_anti" # keys not in target at all
+
+    # step5: Insert new rows (changed + new keys)
+    rows_to_insert = (
+        source_df
+        .join(keys_to_insert,key_cols,"inner")
+    )
+
+    insert_count = rows_to_insert.count()
+
+    if insert_count > 0:
+        (
+            rows_to_insert.write
+            .format("delta")
+            .mode("append")
+            .option("mergeSchema","true")
+            .saveAsTable(target_table)
         )
-    )
-    rows_to_insert = source_df.join(
-        changed_keys.union(new_keys.select(*key_cols)),
-        key_cols,"inner"
-    )
-    (rows_to_insert.write
-     .format("delta")
-     .mode("append")
-     .option("mergeSchema","true")
-     .saveAsTable(target_table)
-     )
     
-    count = rows_to_insert.count()
     if logger:
-        logger.log("dim_addresses","PASS",count,
-                   f"SCD2: {count} new/changed rows inserted into {target_table}")
-                
+        changed_count = changed_keys_df.count()
+        new_count = new_keys_df.count()
+        logger.log(
+            target_table.split(".")[-1],
+            "PASS",
+            insert_count,
+            f"SCD2: {new_count} new keys inserted, " f"{changed_count} changed keys expired + reinserted"
+        )                
 
