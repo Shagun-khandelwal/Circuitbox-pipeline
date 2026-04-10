@@ -175,50 +175,78 @@ def _save_dq_report(spark,dq_rows:list):
 def apply_scd1(
     spark,
     source_df: DataFrame,
-    target_table: str, # e.g. "circuitbox.silver.dim_customers"
+    target_table: str,
     key_cols: list,
     logger: PipelineLogger = None
 ):
-    """ 
-    Upsert source into target on key_cols.
-    Matching row -> update all columns (overwrite)
-    New row  -> insert
+    """
+    SCD Type 1 — upsert latest value per key into target.
+    Deduplicates source on key_cols first (keeps latest by
+    _ingested_at) so MERGE never sees two rows for same key.
     """
 
-    count = source_df.count()
+    # ── Step 1: Deduplicate source ───────────────────────────
+    # When multiple files land (day1 + day2), Bronze has both.
+    # Silver inherits both. We must keep only the latest row
+    # per customer_id before merging — otherwise Delta throws
+    # "multiple source rows matching target row" error.
 
-    if not spark.catalog.tableExists(target_table):
-        # First run - just create it
-        (
-        source_df.write
-        .format("delta")
-        .mode("overwrite")
-        .option("mergeSchema","true")
-        .saveAsTable(target_table)
-        )
+    # Build window: partition by key, order by ingestion time desc
+    dedup_window = Window.partitionBy(*key_cols).orderBy(
+        F.col("_ingested_at").desc()
+    )
+
+    source_deduped = (
+        source_df
+        .withColumn("_row_rank", F.row_number().over(dedup_window))
+        .filter(F.col("_row_rank") == 1)   # keep latest only
+        .drop("_row_rank")
+    )
+
+    deduped_count = source_deduped.count()
+    original_count = source_df.count()
+
+    if original_count != deduped_count:
         if logger:
-            logger.log("dim_customers","PASS",count,
-            f"SCD1 initial load: {count} rows -> {target_table}")
+            logger.log(
+                target_table.split(".")[-1], "WARN", original_count,
+                f"Deduped {original_count} → {deduped_count} rows "
+                f"({original_count - deduped_count} duplicates removed)"
+            )
+
+    # ── Step 2: First run — table doesn't exist yet ──────────
+    if not spark.catalog.tableExists(target_table):
+        (source_deduped.write
+         .format("delta")
+         .mode("overwrite")
+         .option("mergeSchema", "true")
+         .saveAsTable(target_table))
+        if logger:
+            logger.log(
+                target_table.split(".")[-1], "PASS", deduped_count,
+                f"SCD1 initial load: {deduped_count} rows → {target_table}"
+            )
         return
-  
-    dt = DeltaTable.forName(spark,target_table)
+
+    # ── Step 3: Merge deduplicated source into target ────────
+    dt = DeltaTable.forName(spark, target_table)
 
     merge_cond = " AND ".join(
         [f"target.{k} = source.{k}" for k in key_cols]
     )
 
     (dt.alias("target")
-    .merge(source_df.alias("source"),merge_cond)
-    .whenMatchedUpdateAll()  # type 1: overwrite all columns
-    .whenNotMatchedInsertAll() # new customer : insert
-    .execute()
-    )
-  
-    if logger:
-        logger.log("dim_customers","PASS",count,
-        f"SCD1 upsert: {count} source rows merged into {target_table}"
-        )
+       .merge(source_deduped.alias("source"), merge_cond)
+       .whenMatchedUpdateAll()     # SCD1: overwrite all columns
+       .whenNotMatchedInsertAll()  # new customer: insert
+       .execute())
 
+    if logger:
+        logger.log(
+            target_table.split(".")[-1], "PASS", deduped_count,
+            f"SCD1 upsert complete: {deduped_count} rows merged "
+            f"into {target_table}"
+        )
 # COMMAND
 
 # %md
@@ -251,6 +279,18 @@ def apply_scd2(
         .withColumn("effective_end",F.lit(None).cast("string"))
         .withColumn("is_current", F.lit(True))
     )
+    # ── Deduplicate source on key cols ───────────────────────
+    # Same reason as SCD1 — multiple files = duplicate keys
+    dedup_window = Window.partitionBy(*key_cols).orderBy(
+        F.col("_ingested_at").desc()
+    )
+    source_df = (
+        source_df
+        .withColumn("_row_rank", F.row_number().over(dedup_window))
+        .filter(F.col("_row_rank") == 1)
+        .drop("_row_rank")
+    )
+
 
     if not spark.catalog.tableExists(target_table):
         (
@@ -347,5 +387,4 @@ def apply_scd2(
             "PASS",
             insert_count,
             f"SCD2: {new_count} new keys inserted, " f"{changed_count} changed keys expired + reinserted"
-        )                
-
+        )
